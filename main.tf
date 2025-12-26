@@ -1,5 +1,20 @@
 data "aws_availability_zones" "available" {}
 
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
 locals {
   name = var.project_name
 
@@ -107,9 +122,14 @@ resource "aws_eip" "nat" {
   })
 }
 
+/* deterministic first public subnet */
+locals {
+  first_public_subnet_key = sort(keys(aws_subnet.public))[0]
+}
+
 resource "aws_nat_gateway" "this" {
   allocation_id = aws_eip.nat.id
-  subnet_id     = values(aws_subnet.public)[0].id
+  subnet_id     = aws_subnet.public[local.first_public_subnet_key].id
 
   tags = merge(local.tags, {
     Name = "${local.name}-nat"
@@ -138,7 +158,6 @@ resource "aws_route_table_association" "private" {
 
 /* ───────────────────────────── Security Groups ───────────────────────────── */
 
-# ALB SG
 resource "aws_security_group" "alb" {
   name   = "${local.name}-alb-sg"
   vpc_id = aws_vpc.this.id
@@ -162,7 +181,6 @@ resource "aws_security_group" "alb" {
   })
 }
 
-# Private EC2 / ASG instances — allow ONLY ALB
 resource "aws_security_group" "app" {
   name   = "${local.name}-app-sg"
   vpc_id = aws_vpc.this.id
@@ -190,7 +208,7 @@ resource "aws_security_group" "app" {
 /* ───────────────────────────── ALB + TG ───────────────────────────── */
 
 resource "aws_lb_target_group" "app" {
-  name     = "${local.name}-tg"
+  name     = substr("${local.name}-tg", 0, 32)
   port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.this.id
@@ -210,7 +228,7 @@ resource "aws_lb_target_group" "app" {
 }
 
 resource "aws_lb" "app" {
-  name               = "${local.name}-alb"
+  name               = substr("${local.name}-alb", 0, 32)
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = values(aws_subnet.public)[*].id
@@ -240,16 +258,16 @@ resource "aws_launch_template" "app" {
 
   vpc_security_group_ids = [aws_security_group.app.id]
 
-  user_data = base64encode(<<EOF
-#!/bin/bash
-set -xe
-yum update -y
-yum install -y httpd
-echo "OK - $(hostname)" > /var/www/html/index.html
-systemctl enable httpd
-systemctl start httpd
-EOF
-)
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    set -xe
+    yum update -y
+    yum install -y httpd
+    echo "OK - $(hostname)" > /var/www/html/index.html
+    systemctl enable httpd
+    systemctl start httpd
+  EOF
+  )
 
   lifecycle {
     create_before_destroy = true
@@ -280,4 +298,8 @@ resource "aws_autoscaling_group" "app" {
   lifecycle {
     create_before_destroy = true
   }
+
+  depends_on = [
+    aws_lb_listener.http
+  ]
 }
